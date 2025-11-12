@@ -143,6 +143,114 @@ def load_cifar10_iid(
 
     return train_loaders, test_loader, client_sizes
 
+# --- Component 2b: Data Loading (Non-IID) ---
+
+def load_cifar10_noniid_dirichlet(
+    num_clients: int,
+    alpha: float,
+    batch_size: int = 32,
+    seed: int = 42
+) -> Tuple[List[DataLoader], DataLoader, List[int]]:
+    """
+    Load CIFAR-10 and partition using Dirichlet distribution for label skew.
+    
+    Args:
+        num_clients: Number of clients
+        alpha: Dirichlet concentration parameter
+            - Small alpha (e.g., 0.1) = highly skewed (non-IID)
+            - Large alpha (e.g., 100) = nearly uniform (IID)
+        batch_size: Batch size for training
+        seed: Random seed
+    
+    Returns:
+        train_loaders: List of DataLoader per client
+        test_loader: Global test DataLoader
+        client_sizes: Number of samples per client
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # Standard CIFAR-10 transforms (same as IID)
+    transform_train = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ]
+    )
+
+    transform_test = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ]
+    )
+
+    # Load datasets
+    train_dataset = torchvision.datasets.CIFAR10(
+        root="./data", train=True, download=True, transform=transform_train
+    )
+    test_dataset = torchvision.datasets.CIFAR10(
+        root="./data", train=False, download=True, transform=transform_test
+    )
+
+    # Get all labels
+    targets = np.array(train_dataset.targets)
+    num_classes = 10
+    
+    # Initialize client indices
+    client_indices = [[] for _ in range(num_clients)]
+    
+    # For each class, sample from Dirichlet and distribute
+    for k in range(num_classes):
+        # Get indices for class k
+        idx_k = np.where(targets == k)[0]
+        np.random.shuffle(idx_k)
+        
+        # Sample proportions from Dirichlet
+        proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
+        
+        # Ensure proportions sum to 1 (numerical stability)
+        proportions = proportions / proportions.sum()
+        
+        # Convert to actual counts (at least 1 sample per client if possible)
+        counts = (proportions * len(idx_k)).astype(int)
+        
+        # Handle rounding: distribute remaining samples
+        counts[np.argmax(proportions)] += len(idx_k) - counts.sum()
+        
+        # Split and assign to clients
+        start_idx = 0
+        for i, count in enumerate(counts):
+            if count > 0:  # Only add if client gets samples
+                client_indices[i].extend(idx_k[start_idx:start_idx + count])
+                start_idx += count
+
+    # Shuffle each client's data
+    for i in range(num_clients):
+        np.random.shuffle(client_indices[i])
+
+    # Create DataLoaders
+    train_loaders = []
+    client_sizes = []
+
+    for i in range(num_clients):
+        client_subset = Subset(train_dataset, client_indices[i])
+        client_loader = DataLoader(
+            client_subset, batch_size=batch_size, shuffle=True, num_workers=2,
+            # Drop last to avoid batchnorm errors if a client has < batch_size samples
+            drop_last=(len(client_subset) > batch_size) 
+        )
+        train_loaders.append(client_loader)
+        client_sizes.append(len(client_indices[i]))
+
+    test_loader = DataLoader(
+        test_dataset, batch_size=128, shuffle=False, num_workers=2
+    )
+
+    return train_loaders, test_loader, client_sizes
+
 
 # --- Component 3: Client Training ---
 
@@ -153,6 +261,7 @@ def client_update(
     epochs: int,
     lr: float,
     device: torch.device,
+    mu: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Performs K local epochs of SGD on client data.
@@ -172,6 +281,10 @@ def client_update(
     """
     model.to(device)
     model.train()
+    
+    # Store initial global model parameters (frozen) for proximal term
+    if mu > 0:
+        global_params = [param.clone().detach() for param in model.parameters()]
 
     # Standard SGD optimizer
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -183,7 +296,14 @@ def client_update(
 
             optimizer.zero_grad()
             output = model(data)
-            loss = criterion(output, target)
+            loss = criterion(output, target)  # Regular cross-entropy loss
+            
+            if mu > 0:
+                proximal_term = 0.0
+                for param, global_param in zip(model.parameters(), global_params):
+                    proximal_term += (param - global_param).pow(2).sum()
+                loss += (mu / 2) * proximal_term
+
             loss.backward()
             optimizer.step()
 
@@ -323,6 +443,10 @@ def federated_train(
     batch_size: int,
     device: torch.device,
     seed: int = 42,
+    mu: float = 0.0,
+    train_loaders: List[DataLoader] = None,
+    test_loader: DataLoader = None,
+    client_sizes: List[int] = None,
 ) -> Dict[str, List]:
     """
     Main FedAvg training loop.
@@ -344,7 +468,16 @@ def federated_train(
 
     # Initialize model, data, and tracking
     global_model = SimpleCNN().to(device)
-    train_loaders, test_loader, client_sizes = load_cifar10_iid(num_clients, batch_size)
+    # --- Data Loading Logic ---
+    if train_loaders is None:
+        print("Loading IID data (Task 2 compatibility mode)...")
+        train_loaders, test_loader, client_sizes = load_cifar10_iid(
+            num_clients, batch_size
+        )
+    else:
+        print("Using provided data loaders (non-IID mode)...")
+        # Data is already provided, just confirm num_clients
+        num_clients = len(train_loaders)
 
     # Calculate base client weights (N_i)
     total_samples = sum(client_sizes)
@@ -352,10 +485,12 @@ def federated_train(
     # History dictionary to store metrics
     history = {"test_acc": [], "test_loss": [], "client_drift": [], "rounds": []}
 
-    print(f"--- Starting FedAvg Training ---")
+    print(f"--- Starting Federated Training (Algorithm: {'FedProx' if mu > 0 else 'FedAvg'}) ---")
     print(f"  Clients: {num_clients} (sampling {client_fraction*100}%)")
     print(f"  Rounds: {num_rounds}")
     print(f"  Local Epochs (K): {local_epochs}")
+    if mu > 0:
+        print(f"  FedProx (mu): {mu}")
     print("="*70)
 
     pbar = tqdm(range(num_rounds), desc="Federated Training")
@@ -387,6 +522,7 @@ def federated_train(
                 epochs=local_epochs,
                 lr=lr,
                 device=device,
+                mu=mu,
             )
 
             client_models_params.append(updated_params)

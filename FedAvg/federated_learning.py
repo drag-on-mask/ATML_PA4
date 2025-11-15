@@ -303,7 +303,7 @@ def client_update(
     if c_global is not None:
         # SCAFFOLD's corrected gradients conflict with momentum's velocity buffer.
         # The paper's algorithm uses a plain SGD step.
-        current_momentum = 0.65
+        current_momentum = 0.5
     else:
         # FedAvg or FedProx work fine with momentum.
         current_momentum = 0.9
@@ -443,31 +443,55 @@ def harmonize_gradients(
         deltas.append(torch.cat(delta_flat))  # Concatenate into single vector
     
     # 2. Harmonize: iterate through all pairs
-    harmonized_deltas = [d.clone() for d in deltas]  # Make copies
+    # Keep a copy of ORIGINAL deltas for reading (never modify this)
+    deltas_original = [d.clone() for d in deltas]
+    harmonized_deltas = [d.clone() for d in deltas]  # Working copies
     
+    # Clip gradient norm for stability
+    max_norm = 10.0
+
     for i in range(num_clients):
-        for j in range(i + 1, num_clients):  # Only upper triangle
-            g_i = harmonized_deltas[i]
-            g_j = harmonized_deltas[j]
+        for j in range(i + 1, num_clients):
+            # Always read from ORIGINAL deltas
+            g_i_orig = deltas_original[i]
+            g_j_orig = deltas_original[j]
             
-            # Compute dot product
-            dot_product = torch.dot(g_i, g_j).item()
+            # Compute dot product with ORIGINAL vectors
+            dot_product = torch.dot(g_i_orig, g_j_orig).item()
             
             # Check for conflict (negative dot product)
             if dot_product < 0:
-                # Compute norms squared
-                norm_i_sq = torch.dot(g_i, g_i).item()
-                norm_j_sq = torch.dot(g_j, g_j).item()
+                # Compute norms using ORIGINAL values
+                norm_i_sq = torch.dot(g_i_orig, g_i_orig).item()
+                norm_j_sq = torch.dot(g_j_orig, g_j_orig).item()
                 
                 # Avoid division by zero
                 if norm_i_sq > 1e-10 and norm_j_sq > 1e-10:
-                    # Project g_i onto orthogonal complement of g_j
-                    proj_i = (dot_product / norm_j_sq) * g_j
-                    harmonized_deltas[i] = g_i - proj_i
+                    # Get CURRENT harmonized deltas
+                    h_i = harmonized_deltas[i]
+                    h_j = harmonized_deltas[j]
                     
-                    # Project g_j onto orthogonal complement of g_i
-                    proj_j = (dot_product / norm_i_sq) * g_i
-                    harmonized_deltas[j] = g_j - proj_j
+                    # Project using ORIGINAL values but apply to CURRENT
+                    proj_i = (torch.dot(h_i, g_j_orig) / norm_j_sq) * g_j_orig
+                    proj_j = (torch.dot(h_j, g_i_orig) / norm_i_sq) * g_i_orig
+                    
+                    # Apply projections
+                    harmonized_deltas[i] = h_i - proj_i
+                    harmonized_deltas[j] = h_j - proj_j
+                    
+                    # Clip after each projection to prevent explosion
+                    for idx in [i, j]:
+                        grad_norm = torch.norm(harmonized_deltas[idx])
+                        if grad_norm > max_norm:
+                            harmonized_deltas[idx] = harmonized_deltas[idx] * (max_norm / grad_norm)
+    
+    # Prevent exploding gradients with NORM clipping (not value clipping)
+    # This preserves gradient direction while limiting magnitude
+    max_norm = 10.0
+    for client_idx in range(num_clients):
+        grad_norm = torch.norm(harmonized_deltas[client_idx])
+        if grad_norm > max_norm:
+            harmonized_deltas[client_idx] = harmonized_deltas[client_idx] * (max_norm / grad_norm)
     
     # 3. Reconstruct state_dicts from harmonized flat vectors
     harmonized_updates = []

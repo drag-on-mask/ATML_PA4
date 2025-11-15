@@ -262,24 +262,13 @@ def client_update(
     lr: float,
     device: torch.device,
     mu: float = 0.0,
+    rho: float = 0.0,  # <-- ADD THIS
     c_global: List[torch.Tensor] = None,
     c_local_i: List[torch.Tensor] = None,
 ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor]]:
     """
     Performs K local epochs of SGD on client data.
-
-    This function simulates a single client's local training phase.
-    Pattern learned from FedML's Client.train() which delegates to a trainer.
-
-    Args:
-        model: PyTorch model (a copy of the global model)
-        data_loader: Client's local DataLoader
-        epochs: K, the number of local epochs
-        lr: Learning rate for local SGD
-        device: 'cuda' or 'cpu'
-
-    Returns:
-        updated_model_params: state_dict() of the trained local model
+    ...
     """
     model.to(device)
     model.train()
@@ -318,44 +307,136 @@ def client_update(
         for data, target in data_loader:
             data, target = data.to(device), target.to(device)
 
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)  # Regular cross-entropy loss
+            if rho > 0:
+                # =================================================
+                # --- FedSAM Logic (rho > 0) ---
+                # =================================================
 
-            if mu > 0:
-                proximal_term = 0.0
-                for param, global_param_prox in zip(
-                    model.parameters(), global_params_prox
-                ):
-                    proximal_term += (param - global_param_prox).pow(2).sum()
-                loss += (mu / 2) * proximal_term
+                # --- Store original parameters (w) ---
+                original_params = [p.clone().detach() for p in model.parameters()]
 
-            loss.backward()
+                # --- Step 1: Ascent Step (Compute grad L(w)) ---
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)  # L_CE(w)
 
-            # --- SCAFFOLD: Option 1 Logic ---
-            if c_global is not None:
-                grad_idx = 0
-                for param in model.parameters():
-                    if param.requires_grad:
-                        # Now we know param.grad will exist (unless it's a no_grad() block)
-                        if param.grad is not None:
-                            # 1. Accumulate the *original* gradient
-                            avg_grad[grad_idx] += param.grad.data.clone().cpu()
+                # Add FedProx loss (if applicable)
+                if mu > 0:
+                    proximal_term = 0.0
+                    for param, global_param_prox in zip(
+                        model.parameters(), global_params_prox
+                    ):
+                        proximal_term += (param - global_param_prox).pow(2).sum()
+                    loss += (mu / 2) * proximal_term  # L(w) = L_CE(w) + L_prox(w)
 
-                            # 2. Apply the correction
+                loss.backward()  # Computes grad L(w)
+
+                # Store the gradients (g = grad L(w))
+                grads = [
+                    p.grad.clone().detach()
+                    for p in model.parameters()
+                    if p.grad is not None
+                ]
+
+                # --- SCAFFOLD: Accumulate grad L(w) for c_i update ---
+                if c_global is not None:
+                    for i, grad in enumerate(grads):
+                        avg_grad[i] += grad.cpu()
+                # -----------------------------------------------------
+
+                # Calculate the L2 norm of the full gradient vector
+                grad_norm = torch.norm(nn.utils.parameters_to_vector(grads), p=2)
+
+                # Calculate scaling factor: e = (rho / (grad_norm + 1e-12))
+                scale = rho / (grad_norm + 1e-12)
+
+                # --- Manually set model parameters to perturbed state (w_adv) ---
+                # w_adv = w + e * g
+                with torch.no_grad():
+                    grad_idx = 0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.add_(grads[grad_idx], alpha=scale)  # p = p + scale * g
+                            grad_idx += 1
+
+                # --- Step 2: Descent Step (Compute grad L(w_adv)) ---
+                optimizer.zero_grad()  # Clear grads (g)
+                output_adv = model(data)
+                loss_adv = criterion(output_adv, target)  # L_CE(w_adv)
+
+                # Add FedProx loss at w_adv (if applicable)
+                if mu > 0:
+                    proximal_term_adv = 0.0
+                    for param, global_param_prox in zip(
+                        model.parameters(), global_params_prox
+                    ):
+                        proximal_term_adv += (param - global_param_prox).pow(2).sum()
+                    loss_adv += (
+                        mu / 2
+                    ) * proximal_term_adv  # L(w_adv) = L_CE(w_adv) + L_prox(w_adv)
+
+                loss_adv.backward()  # Computes grad L(w_adv)
+
+                # --- Restore original weights (w) ---
+                # The optimizer's .step() will use p.grad (which is grad L(w_adv))
+                # but apply it to the original weights.
+                with torch.no_grad():
+                    for p, p_orig in zip(model.parameters(), original_params):
+                        p.copy_(p_orig)  # p = w
+
+                # --- SCAFFOLD: Apply correction to grad L(w_adv) ---
+                if c_global is not None:
+                    grad_idx = 0
+                    for param in model.parameters():
+                        if param.requires_grad and param.grad is not None:
+                            # Apply the correction to the update gradient (grad L(w_adv))
                             param.grad.data.add_(
                                 c_global[grad_idx].to(device)
                                 - c_local_i[grad_idx].to(device)
                             )
-
-                            # Move to the next gradient tensor
                             grad_idx += 1
-                        # else:
-                        #    (This param was part of a no_grad() block, so no grad was computed)
-            # --------------------------------
+                # ---------------------------------------------------
 
-            optimizer.step()
-            total_steps += 1
+                optimizer.step()  # Applies (potentially corrected) grad L(w_adv) to w
+                total_steps += 1
+
+            else:
+                # =================================================
+                # --- Standard Logic (rho = 0) ---
+                # =================================================
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+
+                if mu > 0:
+                    proximal_term = 0.0
+                    for param, global_param_prox in zip(
+                        model.parameters(), global_params_prox
+                    ):
+                        proximal_term += (param - global_param_prox).pow(2).sum()
+                    loss += (mu / 2) * proximal_term
+
+                loss.backward()
+
+                # --- SCAFFOLD: Option 1 Logic ---
+                if c_global is not None:
+                    grad_idx = 0
+                    for param in model.parameters():
+                        if param.requires_grad:
+                            if param.grad is not None:
+                                # 1. Accumulate the *original* gradient
+                                avg_grad[grad_idx] += param.grad.data.clone().cpu()
+
+                                # 2. Apply the correction
+                                param.grad.data.add_(
+                                    c_global[grad_idx].to(device)
+                                    - c_local_i[grad_idx].to(device)
+                                )
+                                grad_idx += 1
+                # --------------------------------
+
+                optimizer.step()
+                total_steps += 1
 
     # --- SCAFFOLD: Compute control variate update (Option I) ---
     delta_c_i = None
@@ -411,27 +492,28 @@ def aggregate_models(
 
     return global_params
 
+
 def harmonize_gradients(
     client_updates: List[Dict[str, torch.Tensor]],
     global_params: Dict[str, torch.Tensor],
-    device: torch.device
+    device: torch.device,
 ) -> List[Dict[str, torch.Tensor]]:
     """
     FedGH: Harmonize conflicting gradients before aggregation.
-    
+
     For each pair of clients with negative dot product (conflicting updates),
     project each gradient onto the orthogonal complement of the other.
-    
+
     Args:
         client_updates: List of client model state_dicts
         global_params: Global model parameters (for computing deltas)
         device: torch device
-        
+
     Returns:
         harmonized_updates: List of harmonized model state_dicts
     """
     num_clients = len(client_updates)
-    
+
     # 1. Compute gradient deltas (Δθ_i = θ_i - θ_global) for each client
     deltas = []
     for client_params in client_updates:
@@ -441,12 +523,12 @@ def harmonize_gradients(
             delta = client_params[key].to(device) - global_params[key].to(device)
             delta_flat.append(delta.view(-1))  # Flatten
         deltas.append(torch.cat(delta_flat))  # Concatenate into single vector
-    
+
     # 2. Harmonize: iterate through all pairs
     # Keep a copy of ORIGINAL deltas for reading (never modify this)
     deltas_original = [d.clone() for d in deltas]
     harmonized_deltas = [d.clone() for d in deltas]  # Working copies
-    
+
     # Clip gradient norm for stability
     max_norm = 10.0
 
@@ -455,67 +537,71 @@ def harmonize_gradients(
             # Always read from ORIGINAL deltas
             g_i_orig = deltas_original[i]
             g_j_orig = deltas_original[j]
-            
+
             # Compute dot product with ORIGINAL vectors
             dot_product = torch.dot(g_i_orig, g_j_orig).item()
-            
+
             # Check for conflict (negative dot product)
             if dot_product < 0:
                 # Compute norms using ORIGINAL values
                 norm_i_sq = torch.dot(g_i_orig, g_i_orig).item()
                 norm_j_sq = torch.dot(g_j_orig, g_j_orig).item()
-                
+
                 # Avoid division by zero
                 if norm_i_sq > 1e-10 and norm_j_sq > 1e-10:
                     # Get CURRENT harmonized deltas
                     h_i = harmonized_deltas[i]
                     h_j = harmonized_deltas[j]
-                    
+
                     # Project using ORIGINAL values but apply to CURRENT
                     proj_i = (torch.dot(h_i, g_j_orig) / norm_j_sq) * g_j_orig
                     proj_j = (torch.dot(h_j, g_i_orig) / norm_i_sq) * g_i_orig
-                    
+
                     # Apply projections
                     harmonized_deltas[i] = h_i - proj_i
                     harmonized_deltas[j] = h_j - proj_j
-                    
+
                     # Clip after each projection to prevent explosion
                     for idx in [i, j]:
                         grad_norm = torch.norm(harmonized_deltas[idx])
                         if grad_norm > max_norm:
-                            harmonized_deltas[idx] = harmonized_deltas[idx] * (max_norm / grad_norm)
-    
+                            harmonized_deltas[idx] = harmonized_deltas[idx] * (
+                                max_norm / grad_norm
+                            )
+
     # Prevent exploding gradients with NORM clipping (not value clipping)
     # This preserves gradient direction while limiting magnitude
     max_norm = 10.0
     for client_idx in range(num_clients):
         grad_norm = torch.norm(harmonized_deltas[client_idx])
         if grad_norm > max_norm:
-            harmonized_deltas[client_idx] = harmonized_deltas[client_idx] * (max_norm / grad_norm)
-    
+            harmonized_deltas[client_idx] = harmonized_deltas[client_idx] * (
+                max_norm / grad_norm
+            )
+
     # 3. Reconstruct state_dicts from harmonized flat vectors
     harmonized_updates = []
     for client_idx in range(num_clients):
         harmonized_params = {}
         offset = 0
-        
+
         global_params_device = {k: v.to(device) for k, v in global_params.items()}
 
         for key in client_updates[client_idx].keys():
             param_shape = client_updates[client_idx][key].shape
             param_numel = client_updates[client_idx][key].numel()
-            
+
             # Extract this parameter's portion from flat vector
-            param_flat = harmonized_deltas[client_idx][offset:offset + param_numel]
+            param_flat = harmonized_deltas[client_idx][offset : offset + param_numel]
             harmonized_delta = param_flat.view(param_shape)
-            
+
             # Reconstruct: θ_i_new = θ_global + Δθ_i_harmonized
             harmonized_params[key] = global_params_device[key] + harmonized_delta
-            
+
             offset += param_numel
-        
+
         harmonized_updates.append(harmonized_params)
-    
+
     return harmonized_updates
 
 
@@ -616,6 +702,7 @@ def federated_train(
     device: torch.device,
     seed: int = 42,
     mu: float = 0.0,
+    rho: float = 0.0,
     use_scaffold: bool = False,
     use_fedgh: bool = False,
     train_loaders: List[DataLoader] = None,
@@ -678,9 +765,15 @@ def federated_train(
     algo_name = "FedAvg"
     if mu > 0:
         algo_name = "FedProx"
+    if rho > 0:
+        algo_name = "FedSAM"
+        if mu > 0:
+            algo_name = "FedProx+SAM"
     if use_scaffold:
         if mu > 0:
             algo_name = "FedProx+SCAFFOLD"
+        elif rho > 0:
+            algo_name = "SCAFFOLD+SAM"
         else:
             algo_name = "SCAFFOLD"
     if use_fedgh:
@@ -732,6 +825,7 @@ def federated_train(
                 lr=lr,
                 device=device,
                 mu=mu,
+                rho=rho,
                 c_global=c_g_tensors,
                 c_local_i=c_l_i_tensors,
             )
@@ -753,9 +847,7 @@ def federated_train(
         # 4.5. Apply FedGH harmonization if enabled (NEW)
         if use_fedgh:
             client_models_params = harmonize_gradients(
-                client_models_params, 
-                global_params,
-                device
+                client_models_params, global_params, device
             )
 
         # 5. Aggregate Model Weights
